@@ -64,9 +64,31 @@ const BetSlip: React.FC<BetSlipProps> = ({
   currentStake = 20,
   currentOdds
 }) => {
+  console.log('BetSlip mounted with props:', {
+    gameType,
+    currentUserElo, 
+    opponentElo,
+    opponentName,
+    currentOdds
+  })
+
   const [yourStake, setYourStake] = useState(currentStake)
-  const [selectedOdds, setSelectedOdds] = useState(100)
   const [isEditingOdds, setIsEditingOdds] = useState(false)
+
+  // Initialize with calculated odds using existing functions
+  const [selectedOdds, setSelectedOdds] = useState(() => {
+    console.log('Calculating initial odds...')
+    if (currentOdds !== undefined) {
+      console.log('Negotiation mode - using currentOdds:', currentOdds)
+      return currentOdds // Negotiation mode
+    }
+    // Use existing functions for Elo-based odds calculation
+    console.log('New challenge mode - calculating with Elos:', { currentUserElo, opponentElo })
+    const winProb = calculateWinProbability(currentUserElo, opponentElo)
+    const calculatedOdds = probabilityToAmericanOdds(winProb)
+    console.log('Calculated odds result:', { winProb, calculatedOdds })
+    return calculatedOdds
+  })
 
   // Calculate suggested odds based on Elo difference
   const calculateSuggestedOdds = () => {
@@ -74,22 +96,22 @@ const BetSlip: React.FC<BetSlipProps> = ({
     return probabilityToAmericanOdds(winProb)
   }
 
-  // Initialize odds when component mounts or Elo changes
+  // Initialize odds when component mounts or Elo changes - only for prop changes
   useEffect(() => {
     if (currentOdds !== undefined) {
-      // In negotiation mode, start with current odds
+      // In negotiation mode, update to current odds
       setSelectedOdds(currentOdds)
-    } else {
-      // In new challenge mode, use suggested odds
-      const suggested = calculateSuggestedOdds()
-      setSelectedOdds(suggested)
     }
-  }, [currentUserElo, opponentElo, currentOdds])
+    // Don't override initial calculation for new challenges
+  }, [currentOdds]) // Remove Elo dependencies to prevent overriding initial calculation
 
-  // Calculate FanDuel-style payouts
+  // Calculate FanDuel-style payouts - ensure this uses selectedOdds, not hardcoded values
   const calculatePayouts = (odds: number, stake: number) => {
     const stakeNum = Number(stake) || 0
+    console.log('Calculating payouts with odds:', odds, 'stake:', stakeNum)
+    
     if (odds >= 100) {
+      // Positive odds: winnings = (stake * odds) / 100
       const yourWinnings = (stakeNum * odds) / 100
       const opponentStake = yourWinnings
       
@@ -102,6 +124,7 @@ const BetSlip: React.FC<BetSlipProps> = ({
         totalPot: Math.round((stakeNum + opponentStake) * 100) / 100
       }
     } else {
+      // Negative odds: winnings = stake / (Math.abs(odds) / 100)
       const yourWinnings = (stakeNum * 100) / Math.abs(odds)
       const opponentStake = yourWinnings
       
@@ -116,8 +139,14 @@ const BetSlip: React.FC<BetSlipProps> = ({
     }
   }
 
+  // Force payouts to recalculate with current selectedOdds
   const payouts = calculatePayouts(selectedOdds, yourStake)
-  const suggestedOdds = calculateSuggestedOdds()
+  
+  // Recalculate suggested odds for display comparison
+  const currentSuggestedOdds = (() => {
+    const winProb = calculateWinProbability(currentUserElo, opponentElo)
+    return probabilityToAmericanOdds(winProb)
+  })()
 
   const formatOdds = (odds: number) => {
     return odds >= 100 ? `+${odds}` : `${odds}`
@@ -152,9 +181,9 @@ const BetSlip: React.FC<BetSlipProps> = ({
             <span className={`text-lg font-bold ${selectedOdds >= 100 ? 'text-red-600' : 'text-green-600'}`}>
               {formatOdds(selectedOdds)}
             </span>
-            {selectedOdds !== suggestedOdds && (
+            {selectedOdds !== currentSuggestedOdds && (
               <span className="text-xs text-gray-500">
-                (suggested: {formatOdds(suggestedOdds)})
+                (suggested: {formatOdds(currentSuggestedOdds)})
               </span>
             )}
           </div>
@@ -222,7 +251,7 @@ const BetSlip: React.FC<BetSlipProps> = ({
           <div className="flex items-center justify-between">
             <label className="text-xs text-gray-500">ADJUST ODDS</label>
             <span className="text-xs text-gray-500">
-              {isNegotiating ? `Previous: ${formatOdds(currentOdds || 100)}` : `Suggested: ${formatOdds(suggestedOdds)}`}
+              {isNegotiating ? `Previous: ${formatOdds(currentOdds || 100)}` : `Suggested: ${formatOdds(currentSuggestedOdds)}`}
             </span>
           </div>
           
@@ -362,7 +391,8 @@ const ChallengeCreation: React.FC = () => {
     }
   }, [searchParams, supabase])
 
-  // Handle sending challenge or counter-offer to database
+  // MODIFIED FUNCTION: Handle sending challenge or counter-offer to database
+  // THIS IS THE MAIN CHANGE - Phase 1 escrow implementation
   const handleSendChallenge = async (stake: number, odds: number) => {
     if (!selectedOpponent || !currentUser) {
       console.error('Missing required data:', { selectedOpponent, currentUser })
@@ -374,7 +404,7 @@ const ChallengeCreation: React.FC = () => {
     
     try {
       if (isNegotiating && challengeId) {
-        // Update existing challenge with counter-offer
+        // Counter-offer logic (no money changes hands during negotiation)
         console.log('Sending counter-offer for challenge:', challengeId)
         console.log('Update data:', {
           stake_amount: stake,
@@ -405,8 +435,45 @@ const ChallengeCreation: React.FC = () => {
         router.push('/dashboard?counter_offer_sent=true')
         
       } else {
-        // Create new challenge
-        console.log('Creating new challenge:', {
+        // PHASE 1 ESCROW: NEW CHALLENGE - DEDUCT CHALLENGER'S STAKE IMMEDIATELY
+        console.log('Creating new challenge - implementing Phase 1 escrow')
+        
+        // Check challenger's balance (with null safety)
+        const { data: challengerData, error: balanceError } = await supabase
+          .from('users')
+          .select('total_balance')
+          .eq('id', currentUser.id)
+          .single()
+        
+        if (balanceError) throw balanceError
+        
+        const challengerBalance = challengerData?.total_balance ?? 0
+        
+        if (challengerBalance < stake) {
+          throw new Error('Insufficient funds to create challenge')
+        }
+        
+        console.log('=== PHASE 1 ESCROW (CHALLENGE CREATION) ===')
+        console.log('Challenger balance before:', challengerBalance)
+        console.log('Deducting challenger stake:', stake)
+        
+        // PHASE 1: Deduct challenger's stake immediately
+        const { error: deductError } = await supabase
+          .from('users')
+          .update({ 
+            total_balance: challengerBalance - stake 
+          })
+          .eq('id', currentUser.id)
+        
+        if (deductError) {
+          console.error('Failed to deduct challenger stake:', deductError)
+          throw new Error('Failed to process your stake payment')
+        }
+        
+        console.log('Phase 1: Challenger stake deducted successfully')
+        
+        // Create the challenge
+        console.log('Creating challenge record:', {
           challenger_id: currentUser.id,
           challenged_id: selectedOpponent.id,
           game_type: selectedGame,
@@ -430,10 +497,24 @@ const ChallengeCreation: React.FC = () => {
         console.log('Insert result:', { data, error })
 
         if (error) {
+          // Rollback the challenger's stake deduction
+          console.error('Challenge creation failed, rolling back stake deduction')
+          await supabase
+            .from('users')
+            .update({ total_balance: challengerBalance })
+            .eq('id', currentUser.id)
           console.error('Supabase error details:', error)
           throw error
         }
 
+        console.log('=== PHASE 1 ESCROW COMPLETED ===')
+        console.log('Challenge created with challenger stake in escrow')
+        
+        // Force refresh to show updated balance immediately
+        setTimeout(() => {
+          window.location.reload()
+        }, 1000)
+        
         // Success! Redirect to dashboard
         router.push('/dashboard?challenge_sent=true')
       }
@@ -453,6 +534,8 @@ const ChallengeCreation: React.FC = () => {
       setIsSubmitting(false)
     }
   }
+
+  // ALL OTHER FUNCTIONS REMAIN UNCHANGED - preserving working functionality
 
   // Fetch current user and friends with Elo ratings
   useEffect(() => {
@@ -754,7 +837,7 @@ const ChallengeCreation: React.FC = () => {
                   isSubmitting={isSubmitting}
                   isNegotiating={isNegotiating}
                   currentStake={parseInt(searchParams.get('currentStake') || '20')}
-                  currentOdds={parseInt(searchParams.get('currentOdds')?.replace('+', '') || '100')}
+                  currentOdds={isNegotiating ? parseInt(searchParams.get('currentOdds')?.replace('+', '') || '100') : undefined}
                 />
                 
                 <div className="text-center text-sm text-gray-600 space-y-1">

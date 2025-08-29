@@ -94,6 +94,37 @@ export default function DashboardPage() {
   const router = useRouter()
   const supabase = createClient()
 
+  const calculateOpponentStake = (originalStake: number, odds: string): number => {
+    const oddsNum = parseInt(odds.replace('+', ''))
+    
+    if (oddsNum >= 100) {
+      // Positive odds: opponent stake = (original stake * odds) / 100
+      return (originalStake * oddsNum) / 100
+    } else {
+      // Negative odds: opponent stake = original stake / (Math.abs(odds) / 100)  
+      return originalStake / (Math.abs(oddsNum) / 100)
+    }
+  }
+
+  const forceRefreshUserBalance = async () => {
+    if (!user) return
+    
+    console.log('Force refreshing user balance...')
+    const { data: freshUser } = await supabase
+      .from('users')
+      .select('total_balance, total_winnings')
+      .eq('id', user.id)
+      .single()
+    
+    if (freshUser) {
+      setUser(prev => ({
+        ...prev!,
+        total_balance: freshUser.total_balance,
+        total_winnings: freshUser.total_winnings
+      }))
+    }
+  }
+
   const organizeChallenges = (allChallenges: ChallengeData[], currentUserId: string): OrganizedChallenges => {
     return {
       challengesSent: allChallenges.filter(c => 
@@ -244,9 +275,8 @@ export default function DashboardPage() {
       // Simulate processing time (2-3 seconds)
       const processingTime = 2000 + Math.random() * 1000
       setTimeout(() => {
-        // 95% success rate for mock payments
-        const success = Math.random() > 0.05
-        resolve(success)
+        // Always succeed for demo payments - remove artificial failures
+        resolve(true)
       }, processingTime)
     })
   }
@@ -532,11 +562,6 @@ export default function DashboardPage() {
       console.log(`Winner: ${winnerRating.elo_rating} → ${newWinnerRating} (+${newWinnerRating - winnerRating.elo_rating})`)
       console.log(`Loser: ${loserRating.elo_rating} → ${newLoserRating} (${newLoserRating - loserRating.elo_rating})`)
 
-      // Log rating changes to console (Elo updates are not financial transactions)
-      console.log(`Match ${matchId}: Elo ratings updated for ${gameType}`)
-      console.log(`- Winner: ${winnerRating.elo_rating} → ${newWinnerRating} (+${newWinnerRating - winnerRating.elo_rating})`)
-      console.log(`- Loser: ${loserRating.elo_rating} → ${newLoserRating} (${newLoserRating - loserRating.elo_rating})`)
-
       return {
         winnerOldRating: winnerRating.elo_rating,
         winnerNewRating: newWinnerRating,
@@ -579,7 +604,7 @@ export default function DashboardPage() {
           console.log('Fetching winner balance...')
           const { data: winner, error: winnerFetchError } = await supabase
             .from('users')
-            .select('total_balance')
+            .select('total_balance, total_winnings')
             .eq('id', winnerId)
             .single()
           
@@ -588,13 +613,30 @@ export default function DashboardPage() {
             throw winnerFetchError
           }
           
-          // Update winner's balance
+          // Add null safety for winner balance
+          const currentBalance = winner?.total_balance ?? 0
+          const currentWinnings = winner?.total_winnings ?? 0
+          const newBalance = currentBalance + totalPayout
+          const newTotalWinnings = currentWinnings + winnings
+          
+          console.log('=== PAYOUT CALCULATION DEBUG ===')
+          console.log('Winner ID:', winnerId)
+          console.log('Stake amount:', stakeAmount)
+          console.log('Winner odds:', winnerOdds)
+          console.log('Calculated winnings:', winnings)
+          console.log('Total payout:', totalPayout)
+          console.log('Current balance:', currentBalance)
+          console.log('New balance should be:', newBalance)
+          console.log('Current total winnings:', currentWinnings)
+          console.log('New total winnings should be:', newTotalWinnings)
+          
+          // Update winner's balance with null safety
           console.log('Updating winner balance...')
           const { error: payoutError } = await supabase
             .from('users')
             .update({ 
-              total_balance: winner.total_balance + totalPayout,
-              total_winnings: ((winner as any).total_winnings || 0) + winnings
+              total_balance: newBalance,
+              total_winnings: newTotalWinnings
             })
             .eq('id', winnerId)
           
@@ -634,15 +676,6 @@ export default function DashboardPage() {
           if (user) {
             await fetchAllChallenges(user.id)
             await fetchTransactions(user.id)
-            const { data: updatedUser } = await supabase
-              .from('users')
-              .select('*')
-              .eq('id', user.id)
-              .single()
-            
-            if (updatedUser) {
-              setUser({...user, total_balance: updatedUser.total_balance})
-            }
           }
           
           alert(`Match completed! Winner receives ${formatCurrency(totalPayout)} (${formatCurrency(stakeAmount)} stake + ${formatCurrency(winnings)} winnings)\n\nElo Rating Updates:\nWinner: ${eloUpdate.winnerOldRating} → ${eloUpdate.winnerNewRating} (+${eloUpdate.ratingChange.winner})\nLoser: ${eloUpdate.loserOldRating} → ${eloUpdate.loserNewRating} (${eloUpdate.ratingChange.loser})`)
@@ -728,15 +761,6 @@ export default function DashboardPage() {
           if (user) {
             await fetchAllChallenges(user.id)
             await fetchTransactions(user.id)
-            const { data: updatedUser } = await supabase
-              .from('users')
-              .select('*')
-              .eq('id', user.id)
-              .single()
-            
-            if (updatedUser) {
-              setUser({...user, total_balance: updatedUser.total_balance})
-            }
           }
           
           alert(`Match voided due to repeated disagreement. Both players have been refunded their ${formatCurrency(stakeAmount)} stakes.`)
@@ -764,6 +788,7 @@ export default function DashboardPage() {
     }
   }
 
+  // MODIFIED FUNCTION: Phase 2 Escrow - Deduct opponent's calculated stake based on odds
   const handleAcceptChallenge = async (challengeId: string) => {
     setActionLoading(challengeId)
     try {
@@ -772,90 +797,92 @@ export default function DashboardPage() {
         throw new Error('Challenge not found')
       }
       
-      const stakeAmount = challenge.stake_amount
+      const originalStake = challenge.stake_amount
       
-      const { data: challengerData } = await supabase
-        .from('users')
-        .select('total_balance')
-        .eq('id', challenge.challenger_id)
-        .single()
-        
+      // Calculate opponent's stake based on their odds (asymmetric stakes)
+      const challengedOdds = challenge.challenged_odds || challenge.challenger_odds // Fallback if no challenged_odds
+      const opponentStake = calculateOpponentStake(originalStake, challengedOdds)
+      
+      console.log('=== PHASE 2 ESCROW (ACCEPTANCE) ===')
+      console.log('Original challenger stake:', originalStake)
+      console.log('Challenged player odds:', challengedOdds)
+      console.log('Calculated opponent stake:', opponentStake)
+      
+      // Only fetch and deduct from the ACCEPTER (challenged player) - their calculated stake
       const { data: challengedData } = await supabase
         .from('users')
         .select('total_balance')
         .eq('id', challenge.challenged_id)
         .single()
       
-      if (!challengerData || challengerData.total_balance < stakeAmount) {
-        throw new Error('Challenger has insufficient funds')
+      // Null safety for accepter
+      const challengedBalance = challengedData?.total_balance ?? 0
+      
+      if (challengedBalance < opponentStake) {
+        throw new Error(`Insufficient funds. You need ${opponentStake} to accept this challenge.`)
       }
       
-      if (!challengedData || challengedData.total_balance < stakeAmount) {
-        throw new Error('Challenged player has insufficient funds')
-      }
+      console.log('Accepter (challenged) ID:', challenge.challenged_id)
+      console.log('Current user ID:', user?.id)
+      console.log('Accepter balance before:', challengedBalance)
+      console.log('Deducting opponent stake amount:', opponentStake)
+      console.log('NOTE: Challenger already paid:', originalStake, 'in Phase 1')
       
-      const { error: challengerDeductError } = await supabase
-        .from('users')
-        .update({ 
-          total_balance: challengerData.total_balance - stakeAmount 
-        })
-        .eq('id', challenge.challenger_id)
-      
-      if (challengerDeductError) {
-        throw new Error('Failed to process challenger payment')
-      }
-      
+      // PHASE 2: Deduct the opponent's calculated stake (based on their odds)
       const { error: challengedDeductError } = await supabase
         .from('users')
         .update({ 
-          total_balance: challengedData.total_balance - stakeAmount 
+          total_balance: challengedBalance - opponentStake 
         })
         .eq('id', challenge.challenged_id)
       
+      console.log('Accepter deduction result:', { challengedDeductError })
+      
       if (challengedDeductError) {
-        await supabase
-          .from('users')
-          .update({ 
-            total_balance: challengerData.total_balance 
-          })
-          .eq('id', challenge.challenger_id)
-        
-        throw new Error('Failed to process challenged player payment')
+        throw new Error('Failed to process your stake payment')
       }
       
+      // Verify deduction worked
+      const { data: verifyAccepter } = await supabase
+        .from('users')
+        .select('total_balance')
+        .eq('id', challenge.challenged_id)
+        .single()
+
+      console.log('Accepter balance after:', verifyAccepter?.total_balance)
+      
+      // Update challenge status to accepted
       const { error: acceptError } = await supabase
         .from('matches')
         .update({ status: 'accepted' })
         .eq('id', challengeId)
 
       if (acceptError) {
-        await supabase.from('users').update({ total_balance: challengerData.total_balance }).eq('id', challenge.challenger_id)
-        await supabase.from('users').update({ total_balance: challengedData.total_balance }).eq('id', challenge.challenged_id)
+        // Rollback accepter's deduction
+        await supabase
+          .from('users')
+          .update({ total_balance: challengedBalance })
+          .eq('id', challenge.challenged_id)
         throw acceptError
       }
 
+      // Record transaction for accepter (use their actual stake amount)
       await recordTransaction(
         'bet_stake',
-        stakeAmount,
-        `Stake for ${challenge.game_type} match vs ${challenge.challenger_id === user?.id ? challenge.challenged_name : challenge.challenger_name}`,
+        opponentStake,
+        `Stake for ${challenge.game_type} match vs ${challenge.challenger_name}`,
         challengeId
       )
       
       if (user) {
         await fetchAllChallenges(user.id)
         await fetchTransactions(user.id)
-        const { data: updatedUser } = await supabase
-          .from('users')
-          .select('*')
-          .eq('id', user.id)
-          .single()
-        
-        if (updatedUser) {
-          setUser({...user, total_balance: updatedUser.total_balance})
-        }
+        await forceRefreshUserBalance()
       }
       
-      alert('Challenge accepted! Funds have been held in escrow until match completion.')
+      console.log('=== PHASE 2 ESCROW COMPLETED ===')
+      console.log('Total escrow now holds:', originalStake + opponentStake, '(both stakes)')
+      alert(`Challenge accepted! You staked ${opponentStake}. Total pot is now ${originalStake + opponentStake}.`)
 
     } catch (error: any) {
       console.error('Error accepting challenge:', error)
@@ -868,6 +895,46 @@ export default function DashboardPage() {
   const handleDeclineChallenge = async (challengeId: string) => {
     setActionLoading(challengeId)
     try {
+      const challenge = [...challenges.challengeRequests, ...challenges.inNegotiation].find(c => c.id === challengeId)
+      if (!challenge) {
+        throw new Error('Challenge not found')
+      }
+
+      // BASIC REFUND: Challenger always has money in escrow when challenge exists
+      console.log('=== DECLINE REFUND ===')
+      console.log('Challenge declined, refunding challenger stake:', challenge.stake_amount)
+      
+      // Get challenger's current balance
+      const { data: challengerData } = await supabase
+        .from('users')
+        .select('total_balance')
+        .eq('id', challenge.challenger_id)
+        .single()
+      
+      if (challengerData) {
+        const challengerBalance = challengerData?.total_balance ?? 0
+        const refundAmount = challenge.stake_amount
+        
+        console.log('Challenger balance before refund:', challengerBalance)
+        console.log('Refunding amount:', refundAmount)
+        
+        // Refund challenger's stake
+        const { error: refundError } = await supabase
+          .from('users')
+          .update({ 
+            total_balance: challengerBalance + refundAmount 
+          })
+          .eq('id', challenge.challenger_id)
+        
+        if (refundError) {
+          console.error('Error refunding challenger:', refundError)
+          throw new Error('Failed to process refund')
+        }
+        
+        console.log('Challenger refunded successfully')
+      }
+
+      // Update challenge status to declined
       const { error } = await supabase
         .from('matches')
         .update({ status: 'declined' })
@@ -877,9 +944,10 @@ export default function DashboardPage() {
 
       if (user) {
         await fetchAllChallenges(user.id)
+        await fetchTransactions(user.id)
       }
       
-      alert('Challenge declined.')
+      alert('Challenge declined. Challenger has been refunded.')
 
     } catch (error) {
       console.error('Error declining challenge:', error)
@@ -987,9 +1055,30 @@ export default function DashboardPage() {
           return
         }
 
-        setUser(storedUser)
-        await fetchAllChallenges(storedUser.id)
-        await fetchTransactions(storedUser.id)
+        // Fetch fresh user data from database to get current balance
+        console.log('Fetching fresh user data from database...')
+        const { data: freshUser, error } = await supabase
+          .from('users')
+          .select('*')
+          .eq('id', storedUser.id)
+          .single()
+
+        if (freshUser) {
+          console.log('Fresh user data:', freshUser)
+          // Merge stored auth data with fresh database data
+          const mergedUser = { ...storedUser, ...freshUser }
+          setUser(mergedUser)
+          
+          await fetchAllChallenges(storedUser.id)
+          await fetchTransactions(storedUser.id)
+        } else if (error) {
+          console.error('Error fetching fresh user data:', error)
+          // Fall back to stored user if database fetch fails
+          setUser(storedUser)
+          await fetchAllChallenges(storedUser.id)
+          await fetchTransactions(storedUser.id)
+        }
+
       } catch (error) {
         console.error('Error initializing user:', error)
         router.push('/login')
@@ -1001,20 +1090,54 @@ export default function DashboardPage() {
     initializeUser()
   }, [router])
 
+  // MODIFIED FUNCTION: Enhanced real-time subscription system
+  // Listen to ALL user balance changes, not just current user
   useEffect(() => {
     if (!user) return
 
-    const subscription = supabase
+    console.log('Setting up enhanced real-time subscriptions for user:', user.id)
+
+    // Subscription 1: Matches table changes (existing)
+    const matchesSubscription = supabase
       .channel('matches_changes')
       .on('postgres_changes', 
         { event: '*', schema: 'public', table: 'matches' },
         (payload) => {
-          console.log('Real-time update received:', payload)
+          console.log('🔄 Real-time MATCHES update received:', payload)
           fetchAllChallenges(user.id)
         }
       )
       .subscribe()
 
+    // ENHANCED Subscription 2: Listen to ALL user balance changes (not just current user)
+    // This ensures both challenger and accepter see balance updates immediately
+    const allBalanceSubscription = supabase
+      .channel('all_user_balance_changes')
+      .on('postgres_changes', 
+        { event: 'UPDATE', schema: 'public', table: 'users' },
+        async (payload) => {
+          console.log('💰 Real-time BALANCE update received:', payload)
+          
+          const updatedRecord = payload.new as any
+          const updatedUserId = updatedRecord.id
+          
+          // If it's the current user's balance, update state immediately
+          if (updatedUserId === user.id) {
+            console.log('Current user balance updated from', user.total_balance, 'to', updatedRecord.total_balance)
+            setUser(prev => ({
+              ...prev!,
+              total_balance: updatedRecord.total_balance,
+              total_winnings: updatedRecord.total_winnings || prev!.total_winnings
+            }))
+          }
+          
+          // Always refresh challenges to show updated opponent balances and states
+          fetchAllChallenges(user.id)
+        }
+      )
+      .subscribe()
+
+    // Polling fallback (existing)
     const pollInterval = setInterval(() => {
       if (!document.hidden) {
         fetchAllChallenges(user.id)
@@ -1022,7 +1145,9 @@ export default function DashboardPage() {
     }, 15000)
 
     return () => {
-      subscription.unsubscribe()
+      console.log('Cleaning up enhanced real-time subscriptions')
+      matchesSubscription.unsubscribe()
+      allBalanceSubscription.unsubscribe()
       clearInterval(pollInterval)
     }
   }, [user, supabase])
@@ -1164,10 +1289,23 @@ export default function DashboardPage() {
                         </p>
                       </div>
                       <div className="text-right">
-                        <p className="font-bold">{formatCurrency(challenge.stake_amount)}</p>
-                        <p className="text-sm text-gray-600">
-                          Odds: {challenge.challenger_odds} / {challenge.challenged_odds || 'TBD'}
-                        </p>
+                        {(() => {
+                          // Calculate what the recipient (current user) needs to stake
+                          const recipientOdds = challenge.challenged_odds || challenge.challenger_odds
+                          const recipientStake = calculateOpponentStake(challenge.stake_amount, recipientOdds)
+                          
+                          return (
+                            <>
+                              <p className="font-bold">{formatCurrency(recipientStake)}</p>
+                              <p className="text-sm text-gray-600">
+                                Your stake (Odds: {challenge.challenger_odds} / {challenge.challenged_odds || 'TBD'})
+                              </p>
+                              <p className="text-xs text-gray-500">
+                                Opponent risks: {formatCurrency(challenge.stake_amount)}
+                              </p>
+                            </>
+                          )
+                        })()}
                       </div>
                     </div>
                     
@@ -1287,12 +1425,34 @@ export default function DashboardPage() {
                         </p>
                       </div>
                       <div className="text-right">
-                        <p className="font-bold">{formatCurrency(challenge.stake_amount)}</p>
-                        <p className="text-sm text-gray-600">
-                          Your odds: {challenge.challenger_id === user?.id 
-                            ? challenge.challenger_odds 
-                            : challenge.challenged_odds}
-                        </p>
+                        {(() => {
+                          // For active matches, show each player their actual staked amount
+                          const isChallenger = challenge.challenger_id === user?.id
+                          
+                          if (isChallenger) {
+                            // Current user is challenger - show their original stake
+                            return (
+                              <>
+                                <p className="font-bold">{formatCurrency(challenge.stake_amount)}</p>
+                                <p className="text-sm text-gray-600">
+                                  Your stake: {challenge.challenger_odds}
+                                </p>
+                              </>
+                            )
+                          } else {
+                            // Current user is challenged - show their calculated stake
+                            const challengedOdds = challenge.challenged_odds || challenge.challenger_odds
+                            const challengedStake = calculateOpponentStake(challenge.stake_amount, challengedOdds)
+                            return (
+                              <>
+                                <p className="font-bold">{formatCurrency(challengedStake)}</p>
+                                <p className="text-sm text-gray-600">
+                                  Your stake: {challenge.challenged_odds}
+                                </p>
+                              </>
+                            )
+                          }
+                        })()}
                       </div>
                     </div>
                     
